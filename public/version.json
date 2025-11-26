@@ -1,0 +1,8 @@
+﻿{
+  "android_latest": "1.00",
+  "android_min": "1.00",
+  "ios_latest": "1.00",
+  "ios_min": "1.00",
+  "force_update": false,
+  "maintenance": false
+}
