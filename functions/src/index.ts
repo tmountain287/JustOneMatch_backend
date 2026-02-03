@@ -4,6 +4,10 @@ import { defineSecret } from "firebase-functions/params";
 import { google } from "googleapis";
 import { OAuth2Client } from "google-auth-library";
 
+import * as admin from "firebase-admin";
+admin.initializeApp();
+const db = admin.firestore();
+
 /**
  * ============================
  *  Secret Manager (필요한 1개만)
@@ -84,21 +88,26 @@ export const verifyGoogleIdToken = onRequest(async (req, res) => {
 
 
 // ----------------------
-// Google Play 결제 검증
+// Google Play 결제 검증 + 로그 저장
 // ----------------------
 export const verifyPurchase = onRequest(
     { secrets: [GP_JSON] },
     async (req, res) => {
         try {
-            const { packageName, productId, purchaseToken } = req.body ?? {};
+            const { packageName, productId, purchaseToken, accountId } = req.body ?? {};
 
             if (!packageName || !productId || !purchaseToken) {
                 res.status(400).json({ error: "Missing parameters" });
                 return;
             }
 
-            const svcJson = GP_JSON.value();
+            // accountId는 저장용이므로 없으면 "unknown" 처리 (원하면 400으로 막아도 됨)
+            const safeAccountId =
+                typeof accountId === "string" && accountId.length > 0
+                    ? accountId
+                    : "unknown";
 
+            const svcJson = GP_JSON.value();
             if (!svcJson) {
                 res.status(500).json({ error: "Missing GP_SERVICE_ACCOUNT_JSON" });
                 return;
@@ -122,11 +131,62 @@ export const verifyPurchase = onRequest(
                 token: purchaseToken,
             });
 
-            res.json({
-                status: "ok",
-                purchase: result.data,
-            });
+            // ✅ 여기서부터 로그 저장
+            const p = result.data;
 
+            // purchaseState: 0 = Purchased
+            const purchaseState = typeof p.purchaseState === "number" ? p.purchaseState : -1;
+
+            // orderId는 없을 수도 있음(테스트/환경/상품 유형에 따라)
+            const orderId = (p.orderId ?? "") as string;
+
+            // 구매 시간(밀리초 문자열로 올 때가 많음)
+            const purchaseTimeMillisRaw = (p.purchaseTimeMillis ?? "") as string;
+            const purchaseTimeMillis =
+                typeof purchaseTimeMillisRaw === "string" && purchaseTimeMillisRaw.length > 0
+                    ? Number(purchaseTimeMillisRaw)
+                    : null;
+
+            // 멱등키: purchaseToken(가장 흔히 씀)
+            const docId = purchaseToken;
+
+            const logRef = db.collection("iap_purchases").doc(docId);
+
+            // 서버시간/클라시간 둘 다 보관 추천
+            const now = admin.firestore.FieldValue.serverTimestamp();
+
+            await logRef.set(
+                {
+                    // 검색용 필드들
+                    accountId: safeAccountId,
+                    packageName,
+                    productId,
+                    purchaseToken,
+                    orderId,
+
+                    // 검증 결과 요약
+                    purchaseState,
+                    acknowledgementState: p.acknowledgementState ?? null,
+                    consumptionState: p.consumptionState ?? null,
+                    kind: p.kind ?? null,
+
+                    // 시간
+                    purchaseTimeMillis: purchaseTimeMillis,
+                    verifiedAt: now,
+
+                    // 원본(필요한 경우만) — 너무 크면 빼도 됨
+                    purchaseRaw: p,
+                },
+                { merge: true }
+            );
+
+            res.json({
+                ok: true,
+                status: "ok",
+                purchase: p,
+                logged: true,
+                logDocId: docId,
+            });
         } catch (error: any) {
             logger.error("verifyPurchase error:", error);
             res.status(500).json({ error: "Server error", details: error?.message });
